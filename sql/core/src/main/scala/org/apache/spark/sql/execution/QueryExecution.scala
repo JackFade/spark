@@ -17,8 +17,12 @@
 
 package org.apache.spark.sql.execution
 
+import java.io.{BufferedWriter, OutputStreamWriter, Writer}
 import java.nio.charset.StandardCharsets
 import java.sql.{Date, Timestamp}
+
+import org.apache.commons.io.output.StringBuilderWriter
+import org.apache.hadoop.fs.Path
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{AnalysisException, Row, SparkSession}
@@ -29,7 +33,6 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.execution.command.{DescribeTableCommand, ExecutedCommandExec, ShowTablesCommand}
 import org.apache.spark.sql.execution.exchange.{EnsureRequirements, ReuseExchange}
-import org.apache.spark.sql.execution.joins.ReorderJoinPredicates
 import org.apache.spark.sql.types.{BinaryType, DateType, DecimalType, TimestampType, _}
 import org.apache.spark.util.Utils
 
@@ -45,19 +48,7 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
   // TODO: Move the planner an optimizer into here from SessionState.
   protected def planner = sparkSession.sessionState.planner
 
-  def assertAnalyzed(): Unit = {
-    // Analyzer is invoked outside the try block to avoid calling it again from within the
-    // catch block below.
-    analyzed
-    try {
-      sparkSession.sessionState.analyzer.checkAnalysis(analyzed)
-    } catch {
-      case e: AnalysisException =>
-        val ae = new AnalysisException(e.message, e.line, e.startPosition, Option(analyzed))
-        ae.setStackTrace(e.getStackTrace)
-        throw ae
-    }
-  }
+  def assertAnalyzed(): Unit = analyzed
 
   def assertSupported(): Unit = {
     if (sparkSession.sessionState.conf.isUnsupportedOperationCheckEnabled) {
@@ -67,7 +58,7 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
 
   lazy val analyzed: LogicalPlan = {
     SparkSession.setActiveSession(sparkSession)
-    sparkSession.sessionState.analyzer.execute(logical)
+    sparkSession.sessionState.analyzer.executeAndCheck(logical)
   }
 
   lazy val withCachedData: LogicalPlan = {
@@ -102,9 +93,7 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
 
   /** A sequence of rules that will be applied in order to the physical plan before execution. */
   protected def preparations: Seq[Rule[SparkPlan]] = Seq(
-    python.ExtractPythonUDFs,
     PlanSubqueries(sparkSession),
-    new ReorderJoinPredicates,
     EnsureRequirements(sparkSession.sessionState.conf),
     CollapseCodegenStages(sparkSession.sessionState.conf),
     ReuseExchange(sparkSession.sessionState.conf),
@@ -169,6 +158,7 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
       case (null, _) => "null"
       case (s: String, StringType) => "\"" + s + "\""
       case (decimal, DecimalType()) => decimal.toString
+      case (interval, CalendarIntervalType) => interval.toString
       case (other, tpe) if primitiveTypes contains tpe => other.toString
     }
 
@@ -192,36 +182,52 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
           DateTimeUtils.getTimeZone(sparkSession.sessionState.conf.sessionLocalTimeZone))
       case (bin: Array[Byte], BinaryType) => new String(bin, StandardCharsets.UTF_8)
       case (decimal: java.math.BigDecimal, DecimalType()) => formatDecimal(decimal)
+      case (interval, CalendarIntervalType) => interval.toString
       case (other, tpe) if primitiveTypes.contains(tpe) => other.toString
     }
   }
 
-  def simpleString: String = {
+  def simpleString: String = withRedaction {
     s"""== Physical Plan ==
        |${stringOrError(executedPlan.treeString(verbose = false))}
       """.stripMargin.trim
   }
 
-  override def toString: String = {
-    def output = Utils.truncatedString(
-      analyzed.output.map(o => s"${o.name}: ${o.dataType.simpleString}"), ", ")
-    val analyzedPlan = Seq(
-      stringOrError(output),
-      stringOrError(analyzed.treeString(verbose = true))
-    ).filter(_.nonEmpty).mkString("\n")
-
-    s"""== Parsed Logical Plan ==
-       |${stringOrError(logical.treeString(verbose = true))}
-       |== Analyzed Logical Plan ==
-       |$analyzedPlan
-       |== Optimized Logical Plan ==
-       |${stringOrError(optimizedPlan.treeString(verbose = true))}
-       |== Physical Plan ==
-       |${stringOrError(executedPlan.treeString(verbose = true))}
-    """.stripMargin.trim
+  private def writeOrError(writer: Writer)(f: Writer => Unit): Unit = {
+    try f(writer)
+    catch {
+      case e: AnalysisException => writer.write(e.toString)
+    }
   }
 
-  def stringWithStats: String = {
+  private def writePlans(writer: Writer): Unit = {
+    val (verbose, addSuffix) = (true, false)
+
+    writer.write("== Parsed Logical Plan ==\n")
+    writeOrError(writer)(logical.treeString(_, verbose, addSuffix))
+    writer.write("\n== Analyzed Logical Plan ==\n")
+    val analyzedOutput = stringOrError(Utils.truncatedString(
+      analyzed.output.map(o => s"${o.name}: ${o.dataType.simpleString}"), ", "))
+    writer.write(analyzedOutput)
+    writer.write("\n")
+    writeOrError(writer)(analyzed.treeString(_, verbose, addSuffix))
+    writer.write("\n== Optimized Logical Plan ==\n")
+    writeOrError(writer)(optimizedPlan.treeString(_, verbose, addSuffix))
+    writer.write("\n== Physical Plan ==\n")
+    writeOrError(writer)(executedPlan.treeString(_, verbose, addSuffix))
+  }
+
+  override def toString: String = withRedaction {
+    val writer = new StringBuilderWriter()
+    try {
+      writePlans(writer)
+      writer.toString
+    } finally {
+      writer.close()
+    }
+  }
+
+  def stringWithStats: String = withRedaction {
     // trigger to compute stats for logical plans
     optimizedPlan.stats
 
@@ -231,6 +237,13 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
         |== Physical Plan ==
         |${stringOrError(executedPlan.treeString(verbose = true))}
     """.stripMargin.trim
+  }
+
+  /**
+   * Redact the sensitive information in the given string.
+   */
+  private def withRedaction(message: String): String = {
+    Utils.redact(sparkSession.sessionState.conf.stringRedactionPattern, message)
   }
 
   /** A special namespace for commands that can be used to debug query execution. */
@@ -255,6 +268,23 @@ class QueryExecution(val sparkSession: SparkSession, val logical: LogicalPlan) {
      */
     def codegenToSeq(): Seq[(String, String)] = {
       org.apache.spark.sql.execution.debug.codegenStringSeq(executedPlan)
+    }
+
+    /**
+     * Dumps debug information about query execution into the specified file.
+     */
+    def toFile(path: String): Unit = {
+      val filePath = new Path(path)
+      val fs = filePath.getFileSystem(sparkSession.sessionState.newHadoopConf())
+      val writer = new BufferedWriter(new OutputStreamWriter(fs.create(filePath)))
+
+      try {
+        writePlans(writer)
+        writer.write("\n== Whole Stage Codegen ==\n")
+        org.apache.spark.sql.execution.debug.writeCodegen(writer, executedPlan)
+      } finally {
+        writer.close()
+      }
     }
   }
 }

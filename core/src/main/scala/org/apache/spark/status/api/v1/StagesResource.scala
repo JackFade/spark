@@ -25,7 +25,6 @@ import org.apache.spark.scheduler.StageInfo
 import org.apache.spark.status.api.v1.StageStatus._
 import org.apache.spark.status.api.v1.TaskSorting._
 import org.apache.spark.ui.SparkUI
-import org.apache.spark.ui.jobs.UIData.StageUIData
 
 @Produces(Array(MediaType.APPLICATION_JSON))
 private[v1] class StagesResource extends BaseAppResource {
@@ -57,10 +56,18 @@ private[v1] class StagesResource extends BaseAppResource {
       @PathParam("stageAttemptId") stageAttemptId: Int,
       @QueryParam("details") @DefaultValue("true") details: Boolean): StageData = withUI { ui =>
     try {
-      ui.store.stageAttempt(stageId, stageAttemptId, details = details)
+      ui.store.stageAttempt(stageId, stageAttemptId, details = details)._1
     } catch {
       case _: NoSuchElementException =>
-        throw new NotFoundException(s"unknown attempt $stageAttemptId for stage $stageId.")
+        // Change the message depending on whether there are any attempts for the requested stage.
+        val all = ui.store.stageData(stageId)
+        val msg = if (all.nonEmpty) {
+          val ids = all.map(_.attemptId)
+          s"unknown attempt for stage $stageId.  Found attempts: [${ids.mkString(",")}]"
+        } else {
+          s"unknown stage: $stageId"
+        }
+        throw new NotFoundException(msg)
     }
   }
 
@@ -80,7 +87,8 @@ private[v1] class StagesResource extends BaseAppResource {
       }
     }
 
-    ui.store.taskSummary(stageId, stageAttemptId, quantiles)
+    ui.store.taskSummary(stageId, stageAttemptId, quantiles).getOrElse(
+      throw new NotFoundException(s"No tasks reported metrics for $stageId / $stageAttemptId yet."))
   }
 
   @GET

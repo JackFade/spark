@@ -70,6 +70,7 @@ private[ui] class ExecutorTable(stage: StageData, store: AppStatusStore) {
           Blacklisted
           </span>
         </th>
+        <th>Logs</th>
       </thead>
       <tbody>
         {createExecutorTable(stage)}
@@ -87,19 +88,12 @@ private[ui] class ExecutorTable(stage: StageData, store: AppStatusStore) {
   }
 
   private def createExecutorTable(stage: StageData) : Seq[Node] = {
-    stage.executorSummary.getOrElse(Map.empty).toSeq.sortBy(_._1).map { case (k, v) =>
+    val executorSummary = store.executorSummary(stage.stageId, stage.attemptId)
+
+    executorSummary.toSeq.sortBy(_._1).map { case (k, v) =>
       val executor = store.asOption(store.executorSummary(k))
       <tr>
-        <td>
-          <div style="float: left">{k}</div>
-          <div style="float: right">
-          {
-            executor.map(_.executorLogs).getOrElse(Map.empty).map {
-              case (logName, logUrl) => <div><a href={logUrl}>{logName}</a></div>
-            }
-          }
-          </div>
-        </td>
+        <td>{k}</td>
         <td>{executor.map { e => e.hostPort }.getOrElse("CANNOT FIND ADDRESS")}</td>
         <td sorttable_customkey={v.taskTime.toString}>{UIUtils.formatDuration(v.taskTime)}</td>
         <td>{v.failedTasks + v.succeededTasks + v.killedTasks}</td>
@@ -134,7 +128,20 @@ private[ui] class ExecutorTable(stage: StageData, store: AppStatusStore) {
             {Utils.bytesToString(v.diskBytesSpilled)}
           </td>
         }}
-        <td>{executor.map(_.isBlacklisted).getOrElse(false)}</td>
+        {
+          if (executor.map(_.isBlacklisted).getOrElse(false)) {
+            <td>for application</td>
+          } else if (v.isBlacklistedForStage) {
+            <td>for stage</td>
+          } else {
+            <td>false</td>
+          }
+        }
+        <td> {executor.map(_.executorLogs).getOrElse(Map.empty).map {
+          case (logName, logUrl) => <div><a href={logUrl}>{logName}</a></div>
+        }}
+        </td>
+
       </tr>
     }
   }
